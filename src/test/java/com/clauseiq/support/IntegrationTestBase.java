@@ -1,5 +1,6 @@
 package com.clauseiq.support;
 
+import com.clauseiq.ai.AiService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -9,6 +10,7 @@ import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -50,6 +52,13 @@ public abstract class IntegrationTestBase {
 
     @Autowired
     protected MockMvc mockMvc;
+
+    /**
+     * Spy (real offline provider underneath) so tests can inspect exactly what reaches the LLM and
+     * simulate provider outages. Declared here so every test class shares one cached Spring context.
+     */
+    @MockitoSpyBean
+    protected AiService aiService;
 
     @Autowired
     protected ObjectMapper objectMapper;

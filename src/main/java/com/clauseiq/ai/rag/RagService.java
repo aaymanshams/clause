@@ -6,11 +6,14 @@ import com.clauseiq.ai.embedding.RetrievedChunk;
 import com.clauseiq.ai.rag.ChatDtos.ChatResponse;
 import com.clauseiq.ai.rag.ChatDtos.Source;
 import com.clauseiq.search.SemanticSearchService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -23,7 +26,10 @@ import java.util.regex.Pattern;
 @Service
 public class RagService {
 
-    private static final Pattern CITATION = Pattern.compile("\\[S(\\d+)]");
+    private static final Logger log = LoggerFactory.getLogger(RagService.class);
+
+    /** Matches "[S1]" and grouped forms such as "[S1, S3]". */
+    private static final Pattern CITATION_GROUP = Pattern.compile("\\[\\s*(S\\d{1,3}(?:\\s*,\\s*S\\d{1,3})*)\\s*]");
     private static final int EXCERPT_CHARS = 280;
 
     private final SemanticSearchService searchService;
@@ -44,27 +50,36 @@ public class RagService {
         if (answer == null || answer.isBlank() || answer.contains(Prompts.NO_ANSWER)) {
             return new ChatResponse(Prompts.NO_ANSWER, false, List.of(), aiService.providerName());
         }
-        return new ChatResponse(answer, true, citedSources(answer, context), aiService.providerName());
+        Optional<Set<Integer>> cited = validCitations(answer, context.size());
+        if (cited.isEmpty()) {
+            // An answer we cannot trace to the retrieved excerpts is treated as ungrounded.
+            log.warn("Discarding answer with missing or out-of-range citations ({} excerpts retrieved)", context.size());
+            return new ChatResponse(Prompts.NO_ANSWER, false, List.of(), aiService.providerName());
+        }
+        return new ChatResponse(answer, true, toSources(cited.get(), context), aiService.providerName());
     }
 
     /**
-     * Returns only the excerpts the model actually cited. If the model cited nothing, all retrieved
-     * excerpts are returned so the answer is still traceable to its context.
+     * Returns the cited excerpt numbers, or empty if the answer cites nothing or cites an excerpt that
+     * was never provided (a fabricated citation). Sources are therefore always a subset of what was
+     * actually retrieved for this tenant and shown to the model.
      */
-    static List<Source> citedSources(String answer, List<RetrievedChunk> context) {
+    static Optional<Set<Integer>> validCitations(String answer, int contextSize) {
         Set<Integer> cited = new LinkedHashSet<>();
-        Matcher m = CITATION.matcher(answer);
+        Matcher m = CITATION_GROUP.matcher(answer);
         while (m.find()) {
-            int n = Integer.parseInt(m.group(1));
-            if (n >= 1 && n <= context.size()) {
+            for (String label : m.group(1).split("\\s*,\\s*")) {
+                int n = Integer.parseInt(label.substring(1));
+                if (n < 1 || n > contextSize) {
+                    return Optional.empty();
+                }
                 cited.add(n);
             }
         }
-        if (cited.isEmpty()) {
-            for (int i = 1; i <= context.size(); i++) {
-                cited.add(i);
-            }
-        }
+        return cited.isEmpty() ? Optional.empty() : Optional.of(cited);
+    }
+
+    static List<Source> toSources(Set<Integer> cited, List<RetrievedChunk> context) {
         List<Source> sources = new ArrayList<>();
         for (int n : cited) {
             RetrievedChunk c = context.get(n - 1);

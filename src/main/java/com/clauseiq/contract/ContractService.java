@@ -16,15 +16,18 @@ import com.clauseiq.document.DocumentTextExtractor;
 import com.clauseiq.document.FileStorageService;
 import com.clauseiq.security.AuthenticatedUser;
 import com.clauseiq.security.TenantContext;
-import org.springframework.core.task.TaskExecutor;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -44,23 +47,20 @@ public class ContractService {
     private final VectorRepository vectorRepository;
     private final FileStorageService storage;
     private final DocumentTextExtractor textExtractor;
-    private final ContractProcessor processor;
-    private final TaskExecutor executor;
+    private final ContractProcessingQueue processingQueue;
     private final long maxFileSize;
 
     public ContractService(ContractRepository contractRepository, ExtractedContractDataRepository extractedRepository,
                            RiskResultRepository riskRepository, VectorRepository vectorRepository,
                            FileStorageService storage, DocumentTextExtractor textExtractor,
-                           ContractProcessor processor, TaskExecutor contractProcessingExecutor,
-                           ClauseIqProperties properties) {
+                           ContractProcessingQueue processingQueue, ClauseIqProperties properties) {
         this.contractRepository = contractRepository;
         this.extractedRepository = extractedRepository;
         this.riskRepository = riskRepository;
         this.vectorRepository = vectorRepository;
         this.storage = storage;
         this.textExtractor = textExtractor;
-        this.processor = processor;
-        this.executor = contractProcessingExecutor;
+        this.processingQueue = processingQueue;
         this.maxFileSize = properties.storage().maxFileSizeBytes();
     }
 
@@ -74,14 +74,14 @@ public class ContractService {
         try (InputStream in = file.getInputStream()) {
             storagePath = storage.store(user.tenantId(), extension, in);
         } catch (IOException e) {
-            throw new ApiException(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR, "Could not read upload");
+            throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR, "Could not store the uploaded file");
         }
         Contract contract = contractRepository.save(new Contract(user.tenantId(), user.userId(), filename,
                 EXTENSION_TO_TYPE.get(extension), file.getSize(), storagePath));
 
         Long contractId = contract.getId();
         Long tenantId = user.tenantId();
-        executor.execute(() -> processor.process(contractId, tenantId));
+        processingQueue.enqueue(contractId, tenantId);
 
         return contractRepository.findByIdAndTenantId(contractId, tenantId)
                 .map(c -> toSummary(c, List.of()))
@@ -144,23 +144,36 @@ public class ContractService {
 
     public ContractSummary reprocess(Long id) {
         Long tenantId = TenantContext.currentTenantId();
-        Contract contract = findOwned(id, tenantId);
-        if (contract.getStatus() == Contract.Status.PROCESSING) {
-            throw ApiException.conflict("Contract is already being processed");
+        findOwned(id, tenantId);
+        int claimed = contractRepository.transitionStatus(id, tenantId,
+                EnumSet.of(Contract.Status.READY, Contract.Status.FAILED), Contract.Status.UPLOADED);
+        if (claimed == 0) {
+            throw ApiException.conflict("Contract is already queued or being processed");
         }
-        executor.execute(() -> processor.process(id, tenantId));
+        processingQueue.enqueue(id, tenantId);
         return toSummary(findOwned(id, tenantId), List.of());
     }
 
     @Transactional
     public void delete(Long id) {
         Long tenantId = TenantContext.currentTenantId();
-        Contract contract = findOwned(id, tenantId);
+        Contract contract = contractRepository.findForUpdate(id, tenantId)
+                .orElseThrow(() -> ApiException.notFound("Contract not found"));
+        if (contract.getStatus() == Contract.Status.UPLOADED || contract.getStatus() == Contract.Status.PROCESSING) {
+            throw ApiException.conflict("Contract is being processed; delete it once processing has finished");
+        }
         riskRepository.deleteByContractIdAndTenantId(id, tenantId);
         extractedRepository.deleteByContractIdAndTenantId(id, tenantId);
         vectorRepository.deleteByContract(tenantId, id);
         contractRepository.delete(contract);
-        storage.delete(contract.getStoragePath());
+        // Remove the file only once the rows are really gone, so a rollback never leaves a row without its file.
+        String storagePath = contract.getStoragePath();
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                storage.delete(storagePath);
+            }
+        });
     }
 
     /** Another tenant's contract is reported as "not found", never "forbidden", so ids can't be probed. */

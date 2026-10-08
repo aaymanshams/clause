@@ -28,6 +28,12 @@ public class DocumentTextExtractor {
     public static final String DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
     public static final Set<String> SUPPORTED_TYPES = Set.of(PDF, DOCX);
 
+    /**
+     * Upper bound on extracted text (~400 pages). Bounds memory and, more importantly, the number of
+     * chunks sent for embedding: a 10 MB upload can otherwise expand to millions of characters.
+     */
+    static final int DEFAULT_MAX_CHARS = 1_000_000;
+
     public record PageText(Integer pageNumber, String text) {
     }
 
@@ -42,6 +48,15 @@ public class DocumentTextExtractor {
     }
 
     private final Tika tika = new Tika();
+    private final int maxChars;
+
+    public DocumentTextExtractor() {
+        this(DEFAULT_MAX_CHARS);
+    }
+
+    DocumentTextExtractor(int maxChars) {
+        this.maxChars = maxChars;
+    }
 
     /** Detects the real media type from file content (magic bytes), using the name only as a hint. */
     public String detectType(InputStream content, String filename) throws IOException {
@@ -49,11 +64,15 @@ public class DocumentTextExtractor {
     }
 
     public ExtractedDocument extract(InputStream content) throws IOException {
-        PageCollector collector = new PageCollector();
+        PageCollector collector = new PageCollector(maxChars);
         try {
             new AutoDetectParser().parse(content, collector, new Metadata(), new ParseContext());
         } catch (SAXException | TikaException e) {
             throw new IOException("Could not parse document: " + e.getMessage(), e);
+        }
+        if (collector.limitExceeded) {
+            throw new DocumentProcessingException(
+                    "The document contains more than " + maxChars + " characters of text, which exceeds the limit");
         }
         return collector.result();
     }
@@ -62,8 +81,15 @@ public class DocumentTextExtractor {
     private static final class PageCollector extends DefaultHandler {
 
         private final List<StringBuilder> pages = new ArrayList<>();
+        private final int maxChars;
         private StringBuilder current;
         private boolean sawPageDiv;
+        private int totalChars;
+        private boolean limitExceeded;
+
+        PageCollector(int maxChars) {
+            this.maxChars = maxChars;
+        }
 
         @Override
         public void startElement(String uri, String localName, String qName, Attributes attributes) {
@@ -90,6 +116,11 @@ public class DocumentTextExtractor {
 
         @Override
         public void characters(char[] ch, int start, int length) {
+            totalChars += length;
+            if (totalChars > maxChars) {
+                limitExceeded = true; // stop accumulating; the caller rejects the document after parsing
+                return;
+            }
             if (current == null) {
                 current = new StringBuilder();
                 pages.add(current);

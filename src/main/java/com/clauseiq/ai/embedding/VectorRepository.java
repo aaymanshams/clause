@@ -3,6 +3,7 @@ package com.clauseiq.ai.embedding;
 import com.clauseiq.document.TextChunker.TextChunk;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -11,17 +12,23 @@ import java.util.Objects;
 /**
  * pgvector access for contract chunks. Uses plain JDBC because JPA has no native vector type.
  *
- * <p>Tenant isolation: {@code tenantId} is a required parameter of every method and is applied in
- * the SQL WHERE clause <em>before</em> ranking, so another tenant's vectors can never reach the
- * top-K results, the RAG prompt, or the response — regardless of how similar they are.
+ * <p>Tenant isolation: {@code tenantId} is a required parameter of every method and is part of the
+ * SQL WHERE clause, so a row belonging to another tenant can never be returned — and therefore never
+ * reach the top-K results, the RAG prompt, or the response — regardless of how similar it is.
+ *
+ * <p>Recall: with an HNSW index, Postgres scans the approximate nearest neighbours first and filters
+ * afterwards, so a selective tenant filter could return fewer than K rows. pgvector 0.8 iterative
+ * scans keep scanning the index until enough rows pass the filter.
  */
 @Repository
 public class VectorRepository {
 
     private final JdbcTemplate jdbc;
+    private final TransactionTemplate tx;
 
-    public VectorRepository(JdbcTemplate jdbc) {
+    public VectorRepository(JdbcTemplate jdbc, TransactionTemplate tx) {
         this.jdbc = jdbc;
+        this.tx = tx;
     }
 
     public void saveChunks(Long tenantId, Long contractId, List<TextChunk> chunks, List<float[]> embeddings) {
@@ -63,14 +70,18 @@ public class VectorRepository {
         }
         params.add(vector);
         params.add(topK);
-        return jdbc.query(sql, (rs, n) -> new RetrievedChunk(
-                rs.getLong("id"),
-                rs.getLong("contract_id"),
-                rs.getString("original_filename"),
-                rs.getInt("chunk_index"),
-                (Integer) rs.getObject("page_number"),
-                rs.getString("text"),
-                rs.getDouble("similarity")), params.toArray());
+        return tx.execute(status -> {
+            // SET LOCAL only lasts for this transaction, so pooled connections are not affected.
+            jdbc.execute("SET LOCAL hnsw.iterative_scan = strict_order");
+            return jdbc.query(sql, (rs, n) -> new RetrievedChunk(
+                    rs.getLong("id"),
+                    rs.getLong("contract_id"),
+                    rs.getString("original_filename"),
+                    rs.getInt("chunk_index"),
+                    (Integer) rs.getObject("page_number"),
+                    rs.getString("text"),
+                    rs.getDouble("similarity")), params.toArray());
+        });
     }
 
     public void deleteByContract(Long tenantId, Long contractId) {

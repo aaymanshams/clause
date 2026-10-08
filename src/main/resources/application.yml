@@ -19,10 +19,6 @@ spring:
       max-file-size: 10MB
       max-request-size: 11MB
 
-server:
-  error:
-    include-message: always
-
 management:
   endpoints:
     web:
@@ -31,8 +27,8 @@ management:
 
 clauseiq:
   jwt:
-    # Override JWT_SECRET in any real deployment (min 32 bytes).
-    secret: ${JWT_SECRET:change-me-local-dev-secret-change-me-local-dev-secret}
+    # No default on purpose. Unset = random per-process key (local dev). Set JWT_SECRET (32+ bytes) when shared.
+    secret: ${JWT_SECRET:}
     expiration-minutes: ${JWT_EXPIRATION_MINUTES:480}
   storage:
     upload-dir: ${UPLOAD_DIR:./data/uploads}

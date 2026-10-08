@@ -9,6 +9,7 @@ import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class DocumentTextExtractorTest {
 
@@ -33,6 +34,15 @@ class DocumentTextExtractorTest {
         assertThat(doc.paginated()).isFalse();
         assertThat(doc.pages()).allMatch(p -> p.pageNumber() == null);
         assertThat(doc.fullText()).contains("First paragraph.").contains("Second paragraph.");
+    }
+
+    @Test
+    void documentsAboveTheTextLimitAreRejectedWithAUserSafeMessage() {
+        DocumentTextExtractor limited = new DocumentTextExtractor(50);
+        assertThatThrownBy(() -> limited.extract(new ByteArrayInputStream(TestDocuments.pdf(
+                "This page has quite a lot more than fifty characters of contract text on it."))))
+                .isInstanceOf(DocumentProcessingException.class)
+                .hasMessageContaining("exceeds the limit");
     }
 
     @Test

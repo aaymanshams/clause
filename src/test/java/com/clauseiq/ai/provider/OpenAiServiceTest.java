@@ -91,7 +91,7 @@ class OpenAiServiceTest {
 
         assertThat(service.generateAnswer("What is the notice period?", List.of(chunk))).isEqualTo("It is 90 days [S1].");
         verify(client).chat(eq(Prompts.RAG_SYSTEM),
-                contains("[S1] (contract: acme.pdf, page 2)\nNotice period is 90 days."), eq(false));
+                contains("[S1] (contract: acme.pdf, page 2)\n<excerpt>\nNotice period is 90 days.\n</excerpt>"), eq(false));
     }
 
     @Test

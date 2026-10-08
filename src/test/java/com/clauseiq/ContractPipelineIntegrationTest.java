@@ -5,6 +5,8 @@ import com.clauseiq.support.TestDocuments;
 import com.fasterxml.jackson.databind.JsonNode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -12,11 +14,16 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /** Upload -> Tika -> chunks -> pgvector -> extraction -> risks -> search/chat, end to end. */
 class ContractPipelineIntegrationTest extends IntegrationTestBase {
+
+    @Autowired
+    private JdbcTemplate jdbc;
 
     private String token;
 
@@ -104,6 +111,49 @@ class ContractPipelineIntegrationTest extends IntegrationTestBase {
         upload(token, "empty.pdf", new byte[0]).andExpect(status().isBadRequest());
         upload(token, "renamed.docx", TestDocuments.pdf("a pdf pretending to be docx"))
                 .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void onlyAdminsCanDeleteAndDeletionRemovesSearchableChunks() throws Exception {
+        long id = uploadContract(token, "acme-msa.pdf", TestDocuments.pdf(TestDocuments.ACME_PAGE_2));
+        postJson("/api/users", token, Map.of("email", "analyst-" + id + "@pipeline.test",
+                "password", "Sup3rSecret!", "role", "USER")).andExpect(status().isCreated());
+        String userToken = json(postJson("/api/auth/login", null, Map.of(
+                "email", "analyst-" + id + "@pipeline.test", "password", "Sup3rSecret!"))).get("token").asText();
+
+        mockMvc.perform(delete("/api/contracts/" + id).header("Authorization", bearer(userToken)))
+                .andExpect(status().isForbidden());
+
+        mockMvc.perform(delete("/api/contracts/" + id).header("Authorization", bearer(token)))
+                .andExpect(status().isNoContent());
+        mockMvc.perform(get("/api/contracts/" + id).header("Authorization", bearer(token)))
+                .andExpect(status().isNotFound());
+        assertThat(json(postJson("/api/search", token, Map.of("query", "termination notice"))).get("results")).isEmpty();
+    }
+
+    @Test
+    void contractsBeingProcessedCannotBeDeletedOrReprocessedAgain() throws Exception {
+        long id = uploadContract(token, "acme-msa.pdf", TestDocuments.pdf(TestDocuments.ACME_PAGE_2));
+        jdbc.update("UPDATE contracts SET status = 'PROCESSING' WHERE id = ?", id);
+
+        mockMvc.perform(delete("/api/contracts/" + id).header("Authorization", bearer(token)))
+                .andExpect(status().isConflict());
+        mockMvc.perform(post("/api/contracts/" + id + "/reprocess").header("Authorization", bearer(token)))
+                .andExpect(status().isConflict());
+    }
+
+    @Test
+    void reprocessingAReadyContractRunsThePipelineAgain() throws Exception {
+        long id = uploadContract(token, "acme-msa.pdf", TestDocuments.pdf(TestDocuments.ACME_PAGE_2));
+
+        mockMvc.perform(post("/api/contracts/" + id + "/reprocess").header("Authorization", bearer(token)))
+                .andExpect(status().isAccepted());
+
+        JsonNode detail = json(mockMvc.perform(get("/api/contracts/" + id).header("Authorization", bearer(token))));
+        assertThat(detail.at("/contract/status").asText()).isEqualTo("READY");
+        Integer chunkRows = jdbc.queryForObject("SELECT count(*) FROM contract_chunks WHERE contract_id = ?",
+                Integer.class, id);
+        assertThat(chunkRows).isEqualTo(detail.at("/contract/chunkCount").asInt()); // no duplicates
     }
 
     @Test

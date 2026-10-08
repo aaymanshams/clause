@@ -16,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 
 @Service
 public class AuthService {
@@ -24,6 +25,7 @@ public class AuthService {
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
+    private final String dummyHash;
 
     public AuthService(TenantRepository tenantRepository, UserRepository userRepository,
                        PasswordEncoder passwordEncoder, JwtService jwtService) {
@@ -31,6 +33,7 @@ public class AuthService {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.jwtService = jwtService;
+        this.dummyHash = passwordEncoder.encode("timing-equalizer-not-a-real-password");
     }
 
     /** Creates a new tenant (organization) and its first ADMIN user. */
@@ -48,9 +51,12 @@ public class AuthService {
 
     @Transactional(readOnly = true)
     public AuthResponse login(LoginRequest request) {
-        User user = userRepository.findByEmailIgnoreCase(normalize(request.email()))
-                .filter(u -> passwordEncoder.matches(request.password(), u.getPasswordHash()))
-                // Same message for unknown email and wrong password, so accounts can't be enumerated.
+        Optional<User> found = userRepository.findByEmailIgnoreCase(normalize(request.email()));
+        // Always run one BCrypt comparison, and use one message, so neither the response nor its
+        // timing reveals whether an account exists.
+        boolean matches = passwordEncoder.matches(request.password(),
+                found.map(User::getPasswordHash).orElse(dummyHash));
+        User user = found.filter(u -> matches)
                 .orElseThrow(() -> ApiException.unauthorized("Invalid email or password"));
         return toAuthResponse(user, tenantRepository.getReferenceById(user.getTenantId()));
     }

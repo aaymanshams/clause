@@ -19,7 +19,7 @@ Contract lifecycle management (CLM) teams spend hours finding renewal dates, not
 | LLM integration and prompt engineering | `AiService` abstraction, JSON-mode structured extraction, grounded RAG prompt |
 | Semantic search and RAG | OpenAI embeddings → pgvector cosine search → top-K context → cited answers |
 | Secure tenant isolation | Tenant filter applied *in SQL before ranking*; foreign IDs return 404 |
-| Testing and code quality | 61 tests (unit + Testcontainers integration), JaCoCo coverage gate, GitHub Actions CI |
+| Testing and code quality | 80 tests (unit + Testcontainers integration), JaCoCo coverage gate, GitHub Actions CI |
 
 ---
 
@@ -31,7 +31,7 @@ Contract lifecycle management (CLM) teams spend hours finding renewal dates, not
 - **Paragraph-aware chunking**: chunks never span pages, so every citation's page number is exact.
 - **Embeddings in pgvector**: each vector row carries `tenant_id` and `contract_id`. There is an HNSW cosine index.
 - **Semantic search** (`POST /api/search`): tenant-filtered, with an optional single-contract scope.
-- **RAG chat** (`POST /api/chat`): answers only from retrieved excerpts, with `[S1]`-style citations mapped back to contract, page and chunk. If nothing relevant is retrieved, the LLM is **not called** and the API returns a fixed "could not find enough information" answer.
+- **RAG chat** (`POST /api/chat`): answers only from retrieved excerpts, with `[S1]`-style citations mapped back to contract, page and chunk. If nothing relevant is retrieved, the LLM is **not called** and the API returns a fixed "could not find enough information" answer. An answer that cites nothing, or cites an excerpt that was never provided, is **discarded as ungrounded** and the same fallback is returned.
 - **Structured extraction**: parties, effective/expiration dates, renewal terms, termination notice, governing law, liability cap and payment terms. The output is parsed into a typed DTO and **validated** (ISO dates, ranges, date ordering). Invalid output is **retried once with the validation error fed back to the model**, then marked `FAILED`. The contract itself stays searchable.
 - **Risk analysis**: deterministic, unit-tested rules: long termination notice, missing or unlimited liability cap, long auto-renewal, non-preferred governing law, and upcoming expiry. The LLM interprets clause wording; the risk decision is plain code.
 - **Dashboard UI**: a single static page (vanilla JS) for the demo flow: dashboard, contract detail, Ask AI and search.
@@ -106,8 +106,15 @@ Slow AI calls happen **outside** database transactions; results are written in o
 ```text
 question ─► embedding ─► pgvector cosine search WHERE tenant_id = :jwtTenant ─► top-K (≥ similarity threshold)
         └─► none relevant? → fixed "not enough information" answer (no LLM call)
-        └─► grounded prompt with [S1..Sn] excerpts ─► LLM ─► answer ─► keep only cited sources ─► response
+        └─► grounded prompt with [S1..Sn] excerpts ─► LLM ─► answer
+                 └─► no citation, or a citation outside S1..Sn? → fallback answer (ungrounded)
+                 └─► sources = exactly the cited excerpts ─► response
 ```
+
+- **Grounding:** the system prompt restricts the model to the excerpts and asks for an exact fallback sentence when they are insufficient. Excerpts are wrapped in `<excerpt>` tags and the model is told to treat them as data and never as instructions. This mitigates prompt injection from contract text but does not eliminate it.
+- **Citations are verified, not trusted.** Every returned source is one of the chunks actually retrieved for this tenant and shown to the model, and is mapped back to its real contract, page and chunk IDs.
+- **Recall under the tenant filter:** with an HNSW index Postgres finds approximate neighbours first and filters afterwards, so a selective `tenant_id` filter could return fewer than K rows. The search runs with pgvector 0.8 `hnsw.iterative_scan = strict_order`, which keeps scanning until enough rows pass the filter. This needs pgvector ≥ 0.8; the `pgvector/pgvector:pg16` image currently ships 0.8.x.
+- **Relevance threshold:** chunks below a cosine-similarity threshold are dropped (0.2 for OpenAI embeddings, configurable). It is a heuristic, not a calibrated value.
 
 ---
 
@@ -116,28 +123,51 @@ question ─► embedding ─► pgvector cosine search WHERE tenant_id = :jwtTe
 Isolation is **shared database, shared schema, with a `tenant_id` column on every business table**, enforced in the application layer.
 
 1. **The tenant comes from the JWT only.** `TenantContext.currentTenantId()` reads the verified principal. No request DTO has a `tenantId` field, and an extra `tenantId` in a body is ignored (this is tested).
-2. **Every repository method is tenant-scoped**, for example `findByIdAndTenantId` and `findAllByTenantId…`. There is no unscoped lookup in the request path.
-3. **Vector search filters by tenant in SQL before ranking:**
+2. **Every repository method used by a request is tenant-scoped**, for example `findByIdAndTenantId` and `findAllByTenantId…`. The single unscoped query (`findAllByStatusIn`) is used only by startup recovery, never by a request.
+3. **Vector search filters by tenant in the SQL itself:**
    ```sql
    SELECT ... FROM contract_chunks ch
    JOIN contracts c ON c.id = ch.contract_id AND c.tenant_id = ch.tenant_id
    WHERE ch.tenant_id = ? [AND ch.contract_id = ?]
    ORDER BY ch.embedding <=> ?::vector LIMIT ?
    ```
-   Another tenant's chunks can never enter the top-K results, the RAG prompt or the response, however similar they are.
+   A row belonging to another tenant can never be returned, so it can never reach the top-K results, the RAG prompt or the response, however similar it is.
 4. **Another tenant's resource returns `404 Not Found`, not `403`**, so IDs can't be probed.
 
-`TenantIsolationIntegrationTest` covers all of this against real PostgreSQL + pgvector: list, get, risks, reprocess, delete, search, search with a foreign `contractId`, RAG context and citations, dashboard counts, a smuggled `tenantId`, and a repository-level test where tenant B holds 10 *identical* vectors and tenant A still gets none of them.
+`TenantIsolationIntegrationTest` covers all of this against real PostgreSQL + pgvector: list, get, risks, reprocess, delete, search, search with a foreign `contractId`, RAG citations, dashboard counts, and a smuggled `tenantId`. It also captures **the exact context passed to the LLM** to prove it contains only the caller's chunks, and runs a repository-level test where tenant B holds 10 *identical* vectors and tenant A still gets none of them.
+
+This is application-level isolation: a future query that forgets the `tenant_id` predicate would not be caught by the database. PostgreSQL row-level security would add that second layer (see Limitations).
 
 ---
 
 ## Security
 
 - BCrypt password hashing. Password hashes never leave the service layer and are never serialized.
-- Stateless JWT (HS384, `JWT_SECRET` from the environment, minimum 32 bytes), with method-level authorization (`@PreAuthorize("hasRole('ADMIN')")`).
-- Identical error for an unknown email and a wrong password (no account enumeration).
-- Bean Validation on all inputs. Upload checks extension, **detected content type** and size. Stored filenames are random UUIDs, and path traversal is blocked.
+- Stateless HMAC-signed JWT with method-level authorization (`@PreAuthorize("hasRole('ADMIN')")`). **There is no default signing secret:** without `JWT_SECRET` a random key is generated per process (logins reset on restart), and short or placeholder secrets stop the app from starting. A committed default would let anyone forge a token for any tenant.
+- Login gives the same error *and does the same BCrypt work* for an unknown email and a wrong password, so neither the message nor the timing reveals which accounts exist.
+- Bean Validation on all inputs. Upload checks extension, **detected content type** (magic bytes) and size, and extracted text is capped at 1,000,000 characters to bound memory and embedding cost. Stored filenames are random UUIDs, and path traversal is blocked.
 - API keys come only from the environment or `.env` (git-ignored). Errors from the OpenAI client never include request headers (this is tested).
+
+### Error handling
+
+All errors return one JSON shape: `{status, error, message, timestamp}`.
+
+| Situation | Status |
+|---|---|
+| Validation error, malformed JSON, bad path parameter | 400 |
+| Missing/invalid/expired token | 401 |
+| Role not allowed (e.g. USER deleting a contract) | 403 |
+| Unknown ID **or another tenant's ID** | 404 |
+| Wrong method / media type | 405 / 415 |
+| Duplicate email; delete or reprocess while a contract is processing | 409 |
+| AI provider down or rate-limited; processing queue full | 503 |
+| Anything unexpected | 500 (details logged server-side, never returned) |
+
+Processing failures are stored on the contract as a safe, actionable message ("The document could not be read…"). Raw parser or provider errors only go to the server log.
+
+### Processing lifecycle
+
+`UPLOADED → PROCESSING → READY | FAILED`. Reprocessing uses an atomic compare-and-set (`UPDATE … WHERE status IN ('READY','FAILED')`), so two concurrent requests can't both queue the same contract. Delete takes a row lock and is refused while a contract is queued or processing. The processing queue is in memory, so contracts interrupted by a restart are re-queued at startup. This assumes a **single application instance** (see Limitations).
 
 ---
 
@@ -152,14 +182,17 @@ mvn verify        # unit + integration tests + JaCoCo report + coverage gate
 | `TenantIsolationIntegrationTest` | Cross-tenant access through every endpoint and directly at the vector repository |
 | `AuthIntegrationTest` | Register, login, invalid credentials, duplicate email, validation, tampered/missing JWT, role checks |
 | `ContractPipelineIntegrationTest` | Real PDF/DOCX → Tika → chunks → pgvector → extraction → risks → cited chat; spoofed/unsupported files |
+| `ApiErrorHandlingIntegrationTest` | Correct 4xx for malformed input, 503 (without leaked details) when the AI provider fails |
 | `OpenAiServiceTest` (Mockito) | Extraction retry-once-then-fail, prompt grounding, no LLM call on empty context |
 | `OpenAiClientTest` | OpenAI wire format against a local fake server: auth header, JSON mode, embedding ordering, error handling |
-| `RagServiceTest` | Fallback answer, cited-source filtering, tenant passed through |
-| `RiskAnalyzerTest`, `ExtractionValidatorTest`, `TextChunkerTest`, `DocumentTextExtractorTest`, `OfflineAiServiceTest` | Deterministic logic |
+| `RagServiceTest` | Fallback answer, cited-source filtering, rejection of uncited or fabricated citations |
+| `JwtServiceTest` | Expired/foreign-key tokens rejected, random key when unset, placeholder/short secrets refused |
+| `ContractProcessingQueueTest` | Full queue → contract FAILED + 503; restart recovery re-queues with the right tenant |
+| `RiskAnalyzerTest`, `ExtractionValidatorTest`, `TextChunkerTest`, `DocumentTextExtractorTest`, `OfflineAiServiceTest` | Deterministic logic, page numbering, text-size limit |
 
 Integration tests use **Testcontainers** (`pgvector/pgvector:pg16`) and need Docker running. They use the offline AI provider, so they need **no API key** and are fully deterministic.
 
-**Current result: 61 tests, all passing; about 88% line coverage** (the JaCoCo gate in `pom.xml` requires 60%). The HTML report is written to `target/site/jacoco/index.html`.
+**Current result: 80 tests, all passing; about 90% line coverage (73% branch)** (the JaCoCo gate in `pom.xml` requires 60%). The HTML report is written to `target/site/jacoco/index.html`.
 
 ---
 
@@ -205,7 +238,7 @@ Flyway creates the schema, including the `vector` extension, on startup.
 | `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | Chat model for extraction and answers |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | 1536-dimension embeddings (matches the `vector(1536)` column) |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Any OpenAI-compatible endpoint |
-| `JWT_SECRET` | dev placeholder | **Set in any shared environment** (32+ bytes) |
+| `JWT_SECRET` | random per process | **Set in any shared environment** (32+ bytes). If unset, logins reset on every restart |
 | `DB_URL` / `DB_USERNAME` / `DB_PASSWORD` | local `clauseiq` | PostgreSQL connection |
 | `UPLOAD_DIR` | `./data/uploads` | Local file storage |
 
@@ -239,7 +272,7 @@ curl -s localhost:8080/api/chat -H "Authorization: Bearer $TOKEN" -H 'Content-Ty
   -d '{"question":"What is the termination notice period?"}'
 ```
 
-Example chat response:
+Example chat response (illustrative shape; the wording depends on the model):
 
 ```json
 {
@@ -274,13 +307,27 @@ Example chat response:
 - **JDBC for vectors, JPA for everything else.** JPA has no native vector type, and keeping the similarity SQL explicit makes the tenant filter easy to audit.
 - **Deterministic risk rules on LLM-extracted fields**, so the risk output is reproducible, explainable and testable.
 
+## Limitations
+
+Known, deliberate scope limits of this MVP:
+
+- **Application-level tenant isolation only.** Every query filters by `tenant_id` and this is tested, but the database does not enforce it (no row-level security).
+- **Single instance.** The processing queue is in memory, and restart recovery assumes one app instance. Running several instances needs a durable queue or a "claim job" query with `FOR UPDATE SKIP LOCKED`.
+- **Live OpenAI path tested against a local fake server**, not against the real API in CI. The offline provider is lexical (hashed bag-of-words), regex-based and extractive; it keeps the app and tests runnable without a key but is not semantic search.
+- **Extraction reads the first 60,000 characters** of a contract. Terms that only appear later are missed.
+- **Chunking has no overlap**, so a clause split across a chunk boundary is retrieved in two halves.
+- **Auth:** JWTs can't be revoked before they expire (8 h default), there are no refresh tokens, the UI keeps the token in `localStorage`, there is no login rate limiting, and an email address belongs to exactly one tenant.
+- **Scanned PDFs are not supported** (no OCR). They fail with a clear "no extractable text" message.
+- **Governing-law check** is a substring match against a configurable preferred list (e.g. "India" would also match "Indiana").
+- **Docker:** CI runs the Maven build and tests but does not build the Docker image. `docker-compose.yml` publishes Postgres on 5432 with development credentials, so it is for local use only.
+
 ## Future improvements
 
 - PostgreSQL **row-level security** as a second, database-enforced isolation layer
-- pgvector `hnsw.iterative_scan` or per-tenant partial indexes to keep filtered ANN search accurate at large scale
-- A message queue (e.g. Kafka) for ingestion, and splitting `ai`/`document` into separate services
+- A durable job queue for ingestion so processing can scale across instances
 - An extraction evaluation set (labelled contracts, per-field accuracy) and prompt versioning
-- Hybrid search (BM25 + vectors), re-ranking, and OCR for scanned PDFs
+- Hybrid search (BM25 + vectors), chunk overlap, re-ranking, and OCR for scanned PDFs
+- Retry with backoff for transient provider errors (429/5xx)
 - S3-compatible object storage, refresh tokens, per-tenant usage metering and rate limiting
 
 ---

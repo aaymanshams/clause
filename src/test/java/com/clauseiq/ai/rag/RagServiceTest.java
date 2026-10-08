@@ -75,11 +75,31 @@ class RagServiceTest {
     }
 
     @Test
-    void outOfRangeCitationsAreIgnoredAndUncitedAnswersListAllContext() {
-        var context = List.of(chunk(1, 1, "a"), chunk(2, null, "b"));
-        assertThat(RagService.citedSources("x [S9]", context)).hasSize(2);
-        assertThat(RagService.citedSources("x [S2][S2]", context)).singleElement()
-                .satisfies(s -> assertThat(s.pageNumber()).isNull());
+    void groupedCitationsAreAcceptedAndDeduplicated() {
+        assertThat(RagService.validCitations("A [S1, S3] and again [S3].", 3)).contains(java.util.Set.of(1, 3));
+    }
+
+    @Test
+    void answersWithoutCitationsAreRejectedAsUngrounded() {
+        when(searchService.search(TENANT, "q?", null, null)).thenReturn(List.of(chunk(1, 1, "a"), chunk(2, 2, "b")));
+        when(aiService.generateAnswer(any(), any())).thenReturn("The notice period is 90 days.");
+
+        ChatResponse response = ragService.ask(TENANT, "q?", null);
+
+        assertThat(response.answered()).isFalse();
+        assertThat(response.answer()).isEqualTo(Prompts.NO_ANSWER);
+        assertThat(response.sources()).isEmpty();
+    }
+
+    @Test
+    void answersCitingAnExcerptThatWasNeverRetrievedAreRejected() {
+        when(searchService.search(TENANT, "q?", null, null)).thenReturn(List.of(chunk(1, 1, "a"), chunk(2, 2, "b")));
+        when(aiService.generateAnswer(any(), any())).thenReturn("It is 90 days [S1][S7].");
+
+        ChatResponse response = ragService.ask(TENANT, "q?", null);
+
+        assertThat(response.answered()).isFalse();
+        assertThat(response.sources()).isEmpty();
     }
 
     @Test

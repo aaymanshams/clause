@@ -1,6 +1,5 @@
 package com.clauseiq;
 
-import com.clauseiq.ai.AiService;
 import com.clauseiq.ai.embedding.RetrievedChunk;
 import com.clauseiq.ai.embedding.VectorRepository;
 import com.clauseiq.document.TextChunker.TextChunk;
@@ -10,6 +9,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 
@@ -18,6 +18,8 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -31,9 +33,6 @@ class TenantIsolationIntegrationTest extends IntegrationTestBase {
 
     @Autowired
     private VectorRepository vectorRepository;
-
-    @Autowired
-    private AiService aiService;
 
     @Autowired
     private JdbcTemplate jdbc;
@@ -119,6 +118,23 @@ class TenantIsolationIntegrationTest extends IntegrationTestBase {
         assertThat(answerB.get("answered").asBoolean()).isTrue();
         assertThat(answerB.get("answer").asText()).contains("fifteen (15) days");
         answerB.get("sources").forEach(s -> assertThat(s.get("contractId").asLong()).isEqualTo(contractB));
+    }
+
+    @Test
+    @DisplayName("The context actually sent to the LLM contains only the caller's chunks")
+    @SuppressWarnings("unchecked")
+    void llmNeverReceivesAnotherTenantsChunks() throws Exception {
+        // Matches both tenants' documents: termination clauses exist in A's and B's contracts.
+        postJson("/api/chat", tokenA, Map.of("question", "What is the termination notice in days?"))
+                .andExpect(status().isOk());
+
+        ArgumentCaptor<List<RetrievedChunk>> context = ArgumentCaptor.forClass(List.class);
+        verify(aiService).generateAnswer(any(), context.capture());
+        assertThat(context.getValue()).isNotEmpty()
+                .allSatisfy(chunk -> {
+                    assertThat(chunk.contractId()).isEqualTo(contractA);
+                    assertThat(chunk.text()).doesNotContain("Zanzibar", "Globex");
+                });
     }
 
     @Test

@@ -10,6 +10,7 @@ import com.clauseiq.ai.risk.RiskAnalyzer;
 import com.clauseiq.ai.risk.RiskFinding;
 import com.clauseiq.ai.risk.RiskResult;
 import com.clauseiq.ai.risk.RiskResultRepository;
+import com.clauseiq.document.DocumentProcessingException;
 import com.clauseiq.document.DocumentTextExtractor;
 import com.clauseiq.document.DocumentTextExtractor.ExtractedDocument;
 import com.clauseiq.document.FileStorageService;
@@ -20,6 +21,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.util.List;
@@ -77,7 +79,7 @@ public class ContractProcessor {
             }
             String fullText = document.fullText();
             if (fullText.isBlank()) {
-                throw new IllegalStateException("No extractable text found (the file may be a scanned image)");
+                throw new DocumentProcessingException("No extractable text found (the file may be a scanned image)");
             }
 
             List<TextChunk> chunks = chunker.chunk(document.pages());
@@ -89,7 +91,7 @@ public class ContractProcessor {
                 extraction = aiService.extractContractData(fullText);
             } catch (AiException e) {
                 log.warn("Structured extraction failed for contract {}: {}", contractId, e.getMessage());
-                warning = "Structured extraction failed: " + e.getMessage();
+                warning = "Key-term extraction failed; search and chat still work. Try reprocessing later.";
             }
             List<RiskFinding> risks = extraction == null ? List.of() : riskAnalyzer.analyze(extraction);
 
@@ -112,10 +114,24 @@ public class ContractProcessor {
             log.info("Processed contract {} (tenant {}): {} pages, {} chunks, extraction={}, risks={}",
                     contractId, tenantId, document.pages().size(), chunks.size(),
                     contract.getExtractionStatus(), risks.size());
-        } catch (Exception e) {
+        } catch (DocumentProcessingException e) {
+            log.warn("Contract {} (tenant {}) rejected: {}", contractId, tenantId, e.getMessage());
+            fail(contract, e.getMessage());
+        } catch (AiException e) {
+            log.warn("AI provider error while processing contract {} (tenant {}): {}", contractId, tenantId, e.getMessage());
+            fail(contract, "The AI provider was unavailable while processing. Please reprocess later.");
+        } catch (IOException e) {
+            log.warn("Could not read contract {} (tenant {}): {}", contractId, tenantId, e.getMessage());
+            fail(contract, "The document could not be read. It may be corrupted or password-protected.");
+        } catch (RuntimeException e) {
             log.error("Processing failed for contract {} (tenant {})", contractId, tenantId, e);
-            contract.markFailed(e.getMessage());
-            contractRepository.save(contract);
+            fail(contract, "Unexpected error while processing the document.");
         }
+    }
+
+    /** Users see a safe, actionable message; the technical cause is only in the server log. */
+    private void fail(Contract contract, String userMessage) {
+        contract.markFailed(userMessage);
+        contractRepository.save(contract);
     }
 }
