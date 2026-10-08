@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ClauseIQ</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%226%22 fill=%22%233b5bdb%22/%3E%3Ctext x=%2216%22 y=%2222%22 font-size=%2216%22 font-family=%22sans-serif%22 font-weight=%22700%22 fill=%22white%22 text-anchor=%22middle%22%3EIQ%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+    <div class="brand">Clause<span>IQ</span></div>
+    <nav id="nav" hidden>
+        <button data-view="dashboard" class="navlink">Dashboard</button>
+        <button data-view="chat" class="navlink">Ask AI</button>
+        <button data-view="search" class="navlink">Search</button>
+    </nav>
+    <div id="who" class="who" hidden>
+        <span id="who-text"></span>
+        <button id="logout" class="ghost">Log out</button>
+    </div>
+</header>
+
+<main>
+    <!-- Auth -->
+    <section id="view-auth" class="view narrow">
+        <h1>Contract intelligence, isolated per organization</h1>
+        <p class="muted">Upload contracts, extract key terms with an LLM, flag risks, and ask questions answered only from your own documents.</p>
+        <div class="tabs">
+            <button class="tab active" data-tab="login">Log in</button>
+            <button class="tab" data-tab="register">Register organization</button>
+        </div>
+        <form id="form-login" class="card form">
+            <label>Email <input name="email" type="email" required autocomplete="username"></label>
+            <label>Password <input name="password" type="password" required autocomplete="current-password"></label>
+            <button type="submit">Log in</button>
+        </form>
+        <form id="form-register" class="card form" hidden>
+            <label>Organization name <input name="organizationName" required placeholder="Acme Corporation"></label>
+            <label>Admin email <input name="email" type="email" required autocomplete="username"></label>
+            <label>Password (min 8 chars) <input name="password" type="password" minlength="8" required autocomplete="new-password"></label>
+            <button type="submit">Create organization</button>
+        </form>
+        <p id="auth-error" class="error" role="alert"></p>
+    </section>
+
+    <!-- Dashboard -->
+    <section id="view-dashboard" class="view" hidden>
+        <div class="stats">
+            <div class="stat"><div class="label">Contracts</div><div class="value" id="s-contracts">0</div></div>
+            <div class="stat"><div class="label">Processed</div><div class="value" id="s-processed">0</div></div>
+            <div class="stat"><div class="label">Processing</div><div class="value" id="s-processing">0</div></div>
+            <div class="stat"><div class="label">High risks</div><div class="value danger" id="s-high">0</div></div>
+        </div>
+        <div class="card upload">
+            <div>
+                <h2>Upload contract</h2>
+                <p class="muted">PDF or DOCX, up to 10 MB. Processing runs in the background.</p>
+            </div>
+            <form id="form-upload">
+                <input type="file" name="file" accept=".pdf,.docx" required>
+                <button type="submit">Upload</button>
+            </form>
+        </div>
+        <p id="upload-msg" class="muted" role="status"></p>
+        <div class="card">
+            <h2>Contracts <span class="muted small" id="provider"></span></h2>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Name</th><th>Status</th><th>Extraction</th><th>Pages</th><th>Risks</th><th>Uploaded</th></tr></thead>
+                    <tbody id="contracts"></tbody>
+                </table>
+            </div>
+            <p id="empty" class="muted" hidden>No contracts yet. Upload one to get started.</p>
+        </div>
+    </section>
+
+    <!-- Contract detail -->
+    <section id="view-contract" class="view" hidden>
+        <button class="ghost" data-view="dashboard">&larr; Back</button>
+        <h1 id="c-name"></h1>
+        <p id="c-status" class="muted"></p>
+        <p id="c-message" class="warning" hidden></p>
+        <div class="grid2">
+            <div class="card">
+                <h2>Extracted terms</h2>
+                <dl id="c-fields" class="fields"></dl>
+            </div>
+            <div class="card">
+                <h2>Risk summary</h2>
+                <ul id="c-risks" class="risks"></ul>
+            </div>
+        </div>
+        <div class="actions">
+            <button id="c-ask" class="secondary">Ask about this contract</button>
+            <button id="c-reprocess" class="ghost">Reprocess</button>
+        </div>
+    </section>
+
+    <!-- Chat -->
+    <section id="view-chat" class="view narrow" hidden>
+        <h1>Ask AI</h1>
+        <p class="muted" id="chat-scope">Answers come only from your organization's contracts, with sources.</p>
+        <form id="form-chat" class="card form">
+            <label>Question <textarea name="question" rows="3" required placeholder="What is the termination notice period?"></textarea></label>
+            <button type="submit">Ask</button>
+        </form>
+        <div id="chat-result" class="card" hidden>
+            <h2>Answer</h2>
+            <p id="chat-answer" class="answer"></p>
+            <h3>Sources</h3>
+            <ul id="chat-sources" class="sources"></ul>
+        </div>
+    </section>
+
+    <!-- Search -->
+    <section id="view-search" class="view narrow" hidden>
+        <h1>Semantic search</h1>
+        <form id="form-search" class="card form inline">
+            <input name="query" required placeholder="contracts with a 90 day termination period">
+            <button type="submit">Search</button>
+        </form>
+        <ul id="search-results" class="sources"></ul>
+    </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
